@@ -1,0 +1,4 @@
+#!/usr/bin/env python3
+from lean_extract import main
+
+raise SystemExit(main())
