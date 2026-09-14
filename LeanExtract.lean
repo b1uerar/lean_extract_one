@@ -21,6 +21,9 @@ structure CommandData where
   env : Environment
   refs : NameSet := {}
   names : Array Name := #[]
+  context : Array Nat := #[]
+  scopes : Array Nat := #[]
+  attributeTargets : NameSet := {}
 
 instance [Inhabited Environment] : Inhabited CommandData :=
   ⟨{ stx := default, env := default }⟩
@@ -30,6 +33,7 @@ structure Analysis where
   env : Environment
   commands : Array CommandData
   owners : Std.HashMap Name Nat
+  scopeEnds : Std.HashMap Nat (Array Nat)
 
 def getJson (j : Json) (key : String) : IO Json :=
   IO.ofExcept (j.getObjVal? key)
@@ -40,33 +44,123 @@ def getField [FromJson a] (j : Json) (key : String) : IO a :=
 def readJson (path : String) : IO Json := do
   IO.ofExcept (Json.parse (← IO.FS.readFile path))
 
-partial def syntaxRefs (stx : Syntax) (refs : NameSet) : NameSet := Id.run do
+partial def syntaxRefs (env : Environment) (stx : Syntax) (refs : NameSet) : NameSet := Id.run do
   match stx with
-  | .ident _ _ n resolved =>
-    let mut refs := refs.insert n
+  | .ident _ _ _ resolved =>
+    let mut refs := refs
     for r in resolved do
       if let .decl n _ := r then refs := refs.insert n
     return refs
-  | .node _ _ args => return args.foldl (fun acc s => syntaxRefs s acc) refs
+  | .node _ kind args =>
+    let mut refs := refs.insert kind
+    -- Syntax and macro registrations are dependencies even when expansion erases them.
+    for entry in macroAttribute.getEntries env kind do
+      refs := refs.insert entry.declName
+    for (_, category) in (Parser.parserExtension.getState env).categories do
+      if category.kinds.contains kind then refs := refs.insert category.declName
+    return args.foldl (fun acc s => syntaxRefs env s acc) refs
   | _ => return refs
 
-partial def treeRefs (tree : InfoTree) (refs : NameSet) : NameSet := Id.run do
+partial def treeRefs (env : Environment) (mctx : MetavarContext)
+    (tree : InfoTree) (refs : NameSet) : NameSet := Id.run do
   match tree with
-  | .context _ t => return treeRefs t refs
+  | .context (.commandCtx ctx) t => return treeRefs ctx.env ctx.mctx t refs
+  | .context _ t => return treeRefs env mctx t refs
   | .hole _ => return refs
   | .node info children =>
     let mut refs := refs
     match info with
-    | .ofTermInfo i => refs := refs ++ i.expr.getUsedConstantsAsSet
+    | .ofTermInfo i =>
+      refs := refs.insert i.elaborator ++ (instantiateExprMVarsImp mctx i.expr).2.getUsedConstantsAsSet
+    | .ofCommandInfo i => refs := refs.insert i.elaborator
+    | .ofTacticInfo i =>
+      refs := refs.insert i.elaborator
+      -- Intermediate tactic assignments include dependencies erased from the final proof.
+      for goal in i.goalsBefore do
+        refs := refs ++ (instantiateExprMVarsImp i.mctxAfter (.mvar goal)).2.getUsedConstantsAsSet
     | .ofFieldInfo i => refs := refs.insert i.projName ++ i.val.getUsedConstantsAsSet
-    | .ofMacroExpansionInfo i => refs := syntaxRefs i.output refs
+    | .ofMacroExpansionInfo i =>
+      refs := syntaxRefs env i.output (syntaxRefs env i.stx refs)
     | .ofOptionInfo i => refs := refs.insert i.declName
     | _ => pure ()
-    for t in children do refs := treeRefs t refs
+    for t in children do refs := treeRefs env mctx t refs
     return refs
+
+def isScopeCommand (stx : Syntax) : Bool :=
+  [``Parser.Command.namespace, ``Parser.Command.section, ``Parser.Command.end].contains stx.getKind
+
+def isContextCommand (stx : Syntax) : Bool :=
+  [``Parser.Command.variable, ``Parser.Command.universe, ``Parser.Command.open,
+    ``Parser.Command.set_option, ``Parser.Command.include, ``Parser.Command.omit,
+    ``Parser.Command.export].contains stx.getKind
+
+def isDiagnostic (stx : Syntax) : Bool :=
+  [``Parser.Command.check, ``Parser.Command.check_failure, ``Parser.Command.print,
+    ``Parser.Command.printAxioms, ``Parser.Command.printEqns, ``Parser.Command.printSig,
+    ``Parser.Command.synth, ``Parser.Command.version, ``Parser.Command.moduleDoc].contains stx.getKind
+
+def isAttributeCommand (stx : Syntax) : Bool :=
+  [``Parser.Command.attribute, ``Parser.Command.grindPattern, ``Parser.Command.export].contains stx.getKind
+
+partial def hasKind (stx : Syntax) (kind : Name) : Bool :=
+  stx.getKind == kind || stx.getArgs.any (hasKind · kind)
+
+def hasUntrackedEffect (cmd : CommandData) : Bool :=
+  cmd.stx.getKind == ``Parser.Command.initialize ||
+  hasKind cmd.stx ``Parser.Command.eraseAttr ||
+  (cmd.names.isEmpty && !isScopeCommand cmd.stx && !isContextCommand cmd.stx &&
+    !isAttributeCommand cmd.stx && !isDiagnostic cmd.stx)
+
+def attributeTargets (stx : Syntax) (state : Command.State) : NameSet := Id.run do
+  let ids := if stx.getKind == ``Parser.Command.attribute then stx[4].getArgs
+    else if stx.getKind == ``Parser.Command.export then stx[3].getArgs
+    else if stx.getKind == ``Parser.Command.grindPattern then #[stx[2]] else #[]
+  let scope := state.scopes.head!
+  let mut refs := {}
+  for id in ids do
+    for (name, _) in ResolveName.resolveGlobalName state.env scope.opts scope.currNamespace scope.openDecls id.getId do
+      refs := refs.insert name
+  return refs
+
+def referenceFormat (ctx : PPContext) (expr : Expr) : FormatWithInfos :=
+  { fmt := .nil, infos := ({} : PrettyPrinter.InfoPerPos).insert 0 (.ofTermInfo {
+      elaborator := .anonymous, stx := .missing, lctx := ctx.lctx,
+      expectedType? := none, expr := (instantiateExprMVarsImp ctx.mctx expr).2 }) }
+
+-- Decode structured trace payloads without parsing printed names or invoking delaborators.
+def referenceContext (ctx : MessageDataContext) : PPContext :=
+  { env := ppExt.setState ctx.env {
+      ppExprWithInfos := fun ctx e => pure (referenceFormat ctx e)
+      ppConstNameWithInfos := fun ctx n => pure (referenceFormat ctx (.const n []))
+      ppTerm := fun _ _ => pure .nil
+      ppLevel := fun _ _ => pure .nil
+      ppGoal := fun _ _ => pure .nil }
+    mctx := ctx.mctx, lctx := ctx.lctx, opts := ctx.opts.setBool `pp.raw false }
+
+partial def messageRefs (msg : MessageData) (ctx : Option PPContext := none)
+    (refs : NameSet := {}) : BaseIO NameSet := do
+  match msg with
+  | .withContext ctx msg => messageRefs msg (some (referenceContext ctx)) refs
+  | .withNamingContext _ msg | .nest _ msg | .group msg | .tagged _ msg
+  | .ofWidget _ msg => messageRefs msg ctx refs
+  | .compose left right => messageRefs right ctx (← messageRefs left ctx refs)
+  | .trace _ msg children =>
+    let mut refs ← messageRefs msg ctx refs
+    for child in children do refs ← messageRefs child ctx refs
+    return refs
+  | .ofLazy f _ =>
+    let some msg := (← f ctx).get? MessageData | return refs
+    messageRefs msg ctx refs
+  | .ofFormatWithInfos fmt =>
+    let mut refs := refs
+    for (_, info) in fmt.infos do
+      if let .ofTermInfo i := info then refs := refs ++ i.expr.getUsedConstantsAsSet
+    return refs
+  | _ => return refs
 
 def reportMessages (messages : MessageLog) : IO Unit := do
   for msg in messages.toList do
+    if msg.data.hasTag (· == `trace) then continue
     IO.eprintln (← msg.toString)
 
 unsafe def analyze (req : Request) : IO Analysis := do
@@ -75,6 +169,7 @@ unsafe def analyze (req : Request) : IO Analysis := do
   let (header, parserState, messages) ← Parser.parseHeader inputCtx
   let setup := req.setup.getD { name := req.moduleName.toName }
   let opts := (setup.options.toOptions).setBool `Elab.async false
+  let opts := if req.mode == "extract" then opts.setBool `trace.Meta.Tactic.simp.rewrite true else opts
   for lib in setup.dynlibs do Lean.loadDynlib lib
   Lean.enableInitializersExecution
   -- Always derive imports from the source, including during verification.
@@ -96,14 +191,43 @@ unsafe def analyze (req : Request) : IO Analysis := do
   if messages.hasErrors then throw (IO.userError "file failed Lean checking")
   let mut snap := initial
   let mut commands := #[]
+  let mut scopeOwners : Array Nat := #[]
+  let mut contexts : Array (Array Nat) := #[#[]]
+  let mut scopeEnds : Std.HashMap Nat (Array Nat) := {}
   repeat
     let state := snap.elabSnap.resultSnap.get.cmdState
     if !Parser.isTerminalCommand snap.stx then
       let refs := match snap.elabSnap.infoTreeSnap.get.infoTree? with
-        | some tree => treeRefs tree (syntaxRefs snap.stx {})
-        | none => syntaxRefs snap.stx {}
-      commands := commands.push { stx := snap.stx, env := state.env, refs : CommandData }
+        | some tree => treeRefs state.env {} tree (syntaxRefs state.env snap.stx {})
+        | none => syntaxRefs state.env snap.stx {}
+      let i := commands.size
+      let attrTargets := attributeTargets snap.stx state
+      commands := commands.push {
+        stx := snap.stx, env := state.env, refs := refs ++ attrTargets,
+        context := contexts.flatten, scopes := scopeOwners, attributeTargets := attrTargets : CommandData }
+      -- Scope depths come from execution, including dotted namespaces and custom commands.
+      while contexts.size < state.scopes.length do
+        contexts := contexts.push #[]
+        scopeOwners := scopeOwners.push i
+      while contexts.size > state.scopes.length do
+        let owner := scopeOwners.back!
+        scopeEnds := scopeEnds.insert owner ((scopeEnds[owner]?).getD #[] |>.push i)
+        scopeOwners := scopeOwners.pop
+        contexts := contexts.pop
+      if isContextCommand snap.stx then
+        contexts := contexts.modify (contexts.size - 1) (·.push i)
     if let some next := snap.nextCmdSnap? then snap := next.task.get else break
+  for msg in messages.toList do
+    if !msg.data.hasTag (· == `trace) then continue
+    let pos := inputCtx.fileMap.ofPosition msg.pos
+    let mut lo := 0
+    let mut hi := commands.size
+    while lo < hi do
+      let mid := (lo + hi) / 2
+      if commands[mid]!.stx.getPos?.getD 0 <= pos then lo := mid + 1 else hi := mid
+    if lo > 0 then
+      let refs ← messageRefs msg.data
+      commands := commands.modify (lo - 1) fun cmd => { cmd with refs := cmd.refs ++ refs }
   let finalEnv := snap.elabSnap.resultSnap.get.cmdState.env
   let mut owners : Std.HashMap Name Nat := {}
   -- The persistent map contains this file's constants; imported constants live in map1.
@@ -119,7 +243,7 @@ unsafe def analyze (req : Request) : IO Analysis := do
       throw (IO.userError s!"cannot attribute local declaration {n} to source")
     owners := owners.insert n lo
     commands := commands.modify lo fun c => { c with names := c.names.push n }
-  return { source, env := finalEnv, commands, owners }
+  return { source, env := finalEnv, commands, owners, scopeEnds }
 
 def resolveTarget (a : Analysis) (query : String) : IO Name := do
   let candidates := a.owners.toArray.map (·.1) |>.filter fun n =>
@@ -138,48 +262,38 @@ def resolveTarget (a : Analysis) (query : String) : IO Name := do
   let names := (found.map (·.toString)).qsort (· < ·)
   throw (IO.userError s!"ambiguous theorem '{query}'; candidates: {String.intercalate ", " names.toList}")
 
-partial def hasKind (stx : Syntax) (kind : Name) : Bool :=
-  stx.getKind == kind || stx.getArgs.any (hasKind · kind)
-
-partial def removable (stx : Syntax) : Bool :=
-  if stx.getKind == ``Parser.Command.mutual then
-    stx[1].getArgs.all removable
-  else
-    stx.getKind == ``Parser.Command.declaration &&
-      !(hasKind stx ``Parser.Term.attributes) &&
-      !(hasKind stx ``Parser.Command.instance) &&
-      !(hasKind stx ``Parser.Command.classInductive) &&
-      !(hasKind stx ``Parser.Command.classTk) &&
-      !(hasKind stx ``Parser.Command.derivingClasses)
-
 def selectCommands (a : Analysis) (target : Name) : Std.HashSet Nat := Id.run do
   let _ : Inhabited Environment := ⟨a.env⟩
   let mut selected : Std.HashSet Nat := {}
   let mut queue := #[a.owners[target]!]
+  let mut attributes : Array Nat := #[]
+  let mut untracked : Array Nat := #[]
   for i in [:a.commands.size] do
-    if !removable a.commands[i]!.stx then queue := queue.push i
-  -- Unresolved syntax identifiers are matched conservatively by suffix. This also
-  -- covers attribute arguments and quoted names that produce no TermInfo.
-  let mut suffixes : Std.HashMap Name (Array Nat) := {}
-  for (n, i) in a.owners.toArray do
-    let parts := (privateToUserName n).components
-    for j in [:parts.length] do
-      let suffix := (parts.drop j).foldl Name.append .anonymous
-      suffixes := suffixes.insert suffix ((suffixes[suffix]?).getD #[] |>.push i)
+    let cmd := a.commands[i]!
+    if isAttributeCommand cmd.stx then
+      attributes := attributes.push i
+    if hasUntrackedEffect cmd then
+      -- Arbitrary environment mutations have no complete read trace in InfoTree.
+      untracked := untracked.push i
   while !queue.isEmpty do
     let i := queue.back!
     queue := queue.pop
     if selected.contains i then continue
     selected := selected.insert i
     let cmd := a.commands[i]!
+    queue := queue ++ cmd.scopes ++ (a.scopeEnds[i]?).getD #[]
+    if isScopeCommand cmd.stx then continue
+    queue := queue ++ cmd.context
+    for j in untracked do
+      if j < i then queue := queue.push j
     let mut refs := cmd.refs
     for n in cmd.names do
       if let some ci := a.env.find? n then refs := refs ++ ci.getUsedConstantsAsSet
     for n in refs do
       if let some owner := a.owners[n]? then queue := queue.push owner
-      for owner in (suffixes[privateToUserName n |>.eraseMacroScopes]?).getD #[] do
-        -- Source references cannot resolve to ordinary declarations appearing later.
-        if owner <= i then queue := queue.push owner
+    for j in attributes do
+      if j < i && a.commands[j]!.attributeTargets.toArray.any refs.contains then
+        queue := queue.push j
   return selected
 
 def canonicalNames (a : Analysis) (origins : Array Nat) : Std.HashMap Name Name := Id.run do
@@ -270,35 +384,79 @@ def commandHasSorry (a : Analysis) (cmd : CommandData) : Bool :=
     | some ci => ci.getUsedConstantsAsSet.contains ``sorryAx
     | none => false
 
+def commandRanges (a : Analysis) : IO (Array Syntax.Range) := do
+  let rawMap := a.source.toFileMap
+  let parserMap := a.source.crlfToLf.toFileMap
+  a.commands.mapIdxM fun i cmd => do
+    let some range := cmd.stx.getRange?
+      | throw (IO.userError s!"command {i} has no source range")
+    -- Lean parses normalized line endings. Translate its offsets back to raw bytes.
+    return {
+      start := rawMap.ofPosition (parserMap.toPosition range.start)
+      stop := rawMap.ofPosition (parserMap.toPosition range.stop)
+    }
+
+def commentDepth (line : String) (depth : Nat) : Nat := Id.run do
+  let mut chars := line.toList
+  let mut depth := depth
+  while !chars.isEmpty do
+    match chars with
+    | '/' :: '-' :: rest => depth := depth + 1; chars := rest
+    | '-' :: '/' :: rest => depth := depth - 1; chars := rest
+    | '-' :: '-' :: rest =>
+      if depth == 0 then break
+      chars := '-' :: rest
+    | _ :: rest => chars := rest
+    | [] => break
+  return depth
+
+-- Only gaps are compacted. Blank lines inside block comments remain verbatim.
+def compactGap (gap : String) (atFileStart := false) : String := Id.run do
+  let lines := gap.splitOn "\n" |>.toArray
+  let mut output := ""
+  let mut depth := 0
+  let mut blankLines := 0
+  for i in [:lines.size] do
+    let line := lines[i]!
+    let blank := depth == 0 && line.toList.all (fun c => c == ' ' || c == '\t' || c == '\r')
+    -- The first fragment terminates the preceding command; the last may indent the next.
+    let completeBlank := blank && (i > 0 || atFileStart) && i + 1 < lines.size
+    if !completeBlank || blankLines < 2 then
+      output := output ++ line
+      if i + 1 < lines.size then output := output ++ "\n"
+    blankLines := if completeBlank then blankLines + 1 else 0
+    depth := commentDepth line depth
+  return output
+
 def extract (req : Request) (a : Analysis) : IO Unit := do
   let _ : Inhabited Environment := ⟨a.env⟩
   let target ← resolveTarget a req.theoremName
   let selected := selectCommands a target
   let origins := (Array.range a.commands.size).filter selected.contains
   let names := canonicalNames a (Array.range a.commands.size)
+  let ranges ← commandRanges a
+  let mut sourceCommands : Array String := #[]
   let mut output := ""
+  let mut gap := ""
   let mut cursor : String.Pos.Raw := 0
-  let rawMap := a.source.toFileMap
-  let parserMap := a.source.crlfToLf.toFileMap
   for i in [:a.commands.size] do
-    let some range := a.commands[i]!.stx.getRange?
-      | throw (IO.userError s!"command {i} has no source range")
-    -- Lean parses normalized line endings. Translate its offsets back to raw bytes.
-    let range : Syntax.Range := {
-      start := rawMap.ofPosition (parserMap.toPosition range.start)
-      stop := rawMap.ofPosition (parserMap.toPosition range.stop)
-    }
+    let range := ranges[i]!
     if range.start < cursor || range.stop < range.start then
       throw (IO.userError "overlapping source command ranges")
-    -- Delete only command bytes. Inter-command whitespace and ordinary comments stay intact.
-    output := output ++ String.Pos.Raw.extract a.source cursor range.start
+    gap := gap ++ String.Pos.Raw.extract a.source cursor range.start
     if selected.contains i then
-      output := output ++ String.Pos.Raw.extract a.source range.start range.stop
+      let text := String.Pos.Raw.extract a.source range.start range.stop
+      sourceCommands := sourceCommands.push text
+      output := output ++ compactGap gap output.isEmpty ++ text
+      gap := ""
     cursor := range.stop
-  output := output ++ String.Pos.Raw.extract a.source cursor a.source.rawEndPos
+  output := output ++ compactGap (gap ++ String.Pos.Raw.extract a.source cursor a.source.rawEndPos)
   IO.FS.writeFile req.candidate output
   let plan := Json.mkObj [
     ("origins", toJson origins),
+    ("sourceCommands", toJson sourceCommands),
+    ("conservativeCommands", toJson (origins.filter fun i =>
+      isContextCommand a.commands[i]!.stx || hasUntrackedEffect a.commands[i]!)),
     ("certificate", typeCertificate a target names),
     ("sorry", toJson (origins.map fun i => commandHasSorry a a.commands[i]!)),
     ("keptCommands", toJson origins.size),
@@ -341,6 +499,12 @@ def verify (req : Request) (a : Analysis) : IO Unit := do
   for i in [:a.commands.size] do
     if commandHasSorry a a.commands[i]! && !originalSorry[i]! then
       throw (IO.userError s!"extraction introduced sorry in command {origins[i]!}")
+  let sourceCommands : Array String ← getField plan "sourceCommands"
+  let ranges ← commandRanges a
+  for i in [:a.commands.size] do
+    let range := ranges[i]!
+    if sourceCommands[i]? != some (String.Pos.Raw.extract a.source range.start range.stop) then
+      throw (IO.userError s!"extraction changed original source in command {origins[i]!}")
   IO.FS.writeFile req.result (Json.mkObj [("verified", toJson true)]).compress
 
 unsafe def run (args : List String) : IO UInt32 := do
