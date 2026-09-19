@@ -69,8 +69,6 @@
 
 原文逐字保留并不等于 elaboration 后的含义不变。需要严格语义保证或批量生成无需复核的数据时，不能只依赖当前成功提示，应另行核对原配置下的目标类型和证明相关定义。
 
-手工对照的 HashMap、List、`Real.cos_pi_div_five` 三个真实案例未发现上述变化：目标原文、作用域、类型及规范化后的证明项一致，`Real.pi` 定义体也一致。这些结果只覆盖所选目标，不能排除其他常规文件中存在类似问题。反例、检查方法和详细结果见[手工语义审查](REAL_WORLD_TEST_REPORT.md#手工语义审查)。
-
 普通注释也可能在相关声明被删除后留下。它们不影响 Lean 编译，但注释可能看起来在描述下一条保留声明，阅读输出时需留意。空行整理不会删除或重写这些注释。
 
 ## 示例与测试
@@ -83,45 +81,6 @@ python3 -m unittest discover -s tests -v
 ```
 
 测试使用实际 Lean 进程，覆盖传递依赖、完整证明、`sorry`、变量与命名空间、记号和宏、属性与实例、私有声明、结构体、`opaque`、`mutual`、`where`、原文保留、错误输入、名称歧义、Lake 项目和类型变更拒绝。新增测试覆盖被证明项省略的 simp 引理、无关注册的删除、同名声明隔离、作用域删除、跨命名空间 export、属性撤销的控制流影响，以及等价证明改写的拒绝。可通过 `TEST_LEAN=/path/to/lean` 选择测试工具链。
-
-### 上游长文件测试
-
-以下是 Lean 4.26.0 和 Mathlib v4.26.0 下的实际提取结果，每个文件提取一个目标定理。表中数值均为“提取前 → 提取后”。
-
-| 输入文件 | 目标定理 | 总行数 | 非空行数 | 字节数 |
-| --- | --- | ---: | ---: | ---: |
-| `Std/Data/HashMap/Lemmas.lean` | `Std.HashMap.getElem!_map'` | 2,999 → 119 | 2,383 → 56 | 120,105 → 1,970 |
-| `Std/Data/TreeMap/Lemmas.lean` | `Std.TreeMap.equiv_iff_toList_eq` | 4,187 → 103 | 3,303 → 46 | 158,501 → 1,408 |
-| `Mathlib/Data/List/Basic.lean` | `List.foldl_assoc_comm_cons` | 1,245 → 84 | 918 → 50 | 46,180 → 2,131 |
-| `Mathlib/Data/Finset/Card.lean` | `Finset.card_eq_four` | 911 → 123 | 700 → 77 | 37,558 → 3,196 |
-| `Mathlib/Analysis/SpecialFunctions/Trigonometric/Basic.lean` | `Real.cos_pi_div_five` | 1,262 → 230 | 940 → 159 | 46,700 → 7,045 |
-
-输出已将命令之间连续的空行压缩到最多两行。非空行数包含注释、imports 和上下文；保留命令及块注释内部的空行不参与压缩。例如 HashMap 输出从整理前的 1,278 行降到 119 行，非空行仍为 56 行，保留了目标定理、一个所需引理及上下文。
-
-这五个案例均通过提取器当前的编译与一致性检查，以及独立 Lean 编译。数据来自 2026-09-14 的运行记录，检查范围仍受[已知限制](#已知限制)约束。源码版本、耗时和详细记录见[上游长文件测试报告](REAL_WORLD_TEST_REPORT.md)。
-
-`tests/real_world.py` 对固定版本的 Lean 标准库及 Mathlib 文件运行测试。每个案例先检查完整输入，再调用提取工具，最后通过单独的 Lean 命令检查输出。源码来源、SHA-256、执行命令、耗时及日志保存在 `.real-world/results/`，不加入默认单元测试。
-
-标准库案例会从 GitHub 下载源码，并与所选工具链附带的源码逐字节核对：
-
-```bash
-python3 tests/real_world.py --suite std
-```
-
-Mathlib 案例使用 `v4.26.0`，脚本会核对其完整提交号。首次运行需准备源码及对应缓存：
-
-```bash
-git clone --depth 1 --branch v4.26.0 \
-  https://github.com/leanprover-community/mathlib4.git .real-world/mathlib4
-lake -d .real-world/mathlib4 exe cache get \
-  Mathlib/Data/List/Basic.lean Mathlib/Data/Finset/Card.lean \
-  Mathlib/Analysis/SpecialFunctions/Trigonometric/Basic.lean
-python3 tests/real_world.py --suite mathlib
-```
-
-可用 `--case hashmap` 等参数只运行一个案例，用 `--lean /path/to/lean` 指定工具链。标准库源码使用 `module`，其独立检查命令显式设置 `-Dexperimental.module=true`，与上游 Std 模块的构建配置一致。
-
-Mathlib 原文件通过 `lake lean` 检查。输出位于库目录之外，因此独立复查通过 `lean --setup` 显式沿用输入模块的完整 Lake 配置，配置文件也保存在测试结果目录。直接对库目录外的输出运行 `lake lean`，可能会丢失库级选项，例如 `experimental.module`。
 
 ## 实现文件
 

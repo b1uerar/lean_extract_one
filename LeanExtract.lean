@@ -4,6 +4,11 @@ open Lean Lean.Elab
 
 namespace LeanExtract
 
+structure SavedCommand where
+  names : Array String
+  source : String
+  deriving FromJson, ToJson
+
 structure Request where
   mode : String
   input : String
@@ -14,6 +19,10 @@ structure Request where
   plan : String := ""
   logicalFile : String := ""
   setup : Option ModuleSetup := none
+  baseline : String := ""
+  children : Array String := #[]
+  generated : Array SavedCommand := #[]
+  retain : Array String := #[]
   deriving FromJson
 
 structure CommandData where
@@ -163,13 +172,16 @@ def reportMessages (messages : MessageLog) : IO Unit := do
     if msg.data.hasTag (· == `trace) then continue
     IO.eprintln (← msg.toString)
 
-unsafe def analyze (req : Request) : IO Analysis := do
-  let source ← IO.FS.readFile req.input
+unsafe def analyze (req : Request) (sourceOverride : Option String := none) : IO Analysis := do
+  let source ← match sourceOverride with
+    | some source => pure source
+    | none => IO.FS.readFile req.input
   let inputCtx := Parser.mkInputContext source (if req.logicalFile.isEmpty then req.input else req.logicalFile)
   let (header, parserState, messages) ← Parser.parseHeader inputCtx
   let setup := req.setup.getD { name := req.moduleName.toName }
   let opts := (setup.options.toOptions).setBool `Elab.async false
-  let opts := if req.mode == "extract" then opts.setBool `trace.Meta.Tactic.simp.rewrite true else opts
+  let opts := if req.mode == "extract" || req.mode == "prune" then
+    opts.setBool `trace.Meta.Tactic.simp.rewrite true else opts
   for lib in setup.dynlibs do Lean.loadDynlib lib
   Lean.enableInitializersExecution
   -- Always derive imports from the source, including during verification.
@@ -262,10 +274,10 @@ def resolveTarget (a : Analysis) (query : String) : IO Name := do
   let names := (found.map (·.toString)).qsort (· < ·)
   throw (IO.userError s!"ambiguous theorem '{query}'; candidates: {String.intercalate ", " names.toList}")
 
-def selectCommands (a : Analysis) (target : Name) : Std.HashSet Nat := Id.run do
+def selectFromCommands (a : Analysis) (seeds : Array Nat) : Std.HashSet Nat := Id.run do
   let _ : Inhabited Environment := ⟨a.env⟩
   let mut selected : Std.HashSet Nat := {}
-  let mut queue := #[a.owners[target]!]
+  let mut queue := seeds
   let mut attributes : Array Nat := #[]
   let mut untracked : Array Nat := #[]
   for i in [:a.commands.size] do
@@ -295,6 +307,9 @@ def selectCommands (a : Analysis) (target : Name) : Std.HashSet Nat := Id.run do
       if j < i && a.commands[j]!.attributeTargets.toArray.any refs.contains then
         queue := queue.push j
   return selected
+
+def selectCommands (a : Analysis) (target : Name) : Std.HashSet Nat :=
+  selectFromCommands a #[a.owners[target]!]
 
 def canonicalNames (a : Analysis) (origins : Array Nat) : Std.HashMap Name Name := Id.run do
   let mut names := {}
@@ -507,14 +522,175 @@ def verify (req : Request) (a : Analysis) : IO Unit := do
       throw (IO.userError s!"extraction changed original source in command {origins[i]!}")
   IO.FS.writeFile req.result (Json.mkObj [("verified", toJson true)]).compress
 
+def commandText (a : Analysis) (ranges : Array Syntax.Range) (i : Nat) : String :=
+  String.Pos.Raw.extract a.source ranges[i]!.start ranges[i]!.stop
+
+def visibleName (n : Name) : String :=
+  ((privateToUserName n).eraseMacroScopes).toString
+
+structure ChangePlan where
+  origins : Array Nat
+  matched : Std.HashSet Nat
+  added : Array SavedCommand
+
+def targetScopeAnchors (before a : Analysis) (oldRanges ranges : Array Syntax.Range)
+    (oldOwner owner : Nat) : IO (Std.HashMap Nat Nat) := do
+  let _ : Inhabited Environment := ⟨a.env⟩
+  let scopes := a.commands[owner]!.scopes
+  let mut fixed := {}
+  let mut cursor := 0
+  for oldScope in before.commands[oldOwner]!.scopes do
+    let mut found := false
+    while cursor < scopes.size do
+      let scope := scopes[cursor]!
+      cursor := cursor + 1
+      if commandText before oldRanges oldScope == commandText a ranges scope then
+        fixed := fixed.insert oldScope scope
+        found := true
+        break
+    unless found do
+      throw (IO.userError "Submission changed an enclosing scope of the assigned theorem")
+  return fixed
+
+def matchingScopeEnd (before a : Analysis) (anchors : Array Nat) (i j : Nat) : Bool :=
+  before.scopeEnds.toArray.all fun (owner, ends) =>
+    !ends.contains i || (anchors[owner]?).any fun actual =>
+      ((a.scopeEnds[actual]?).getD #[]).contains j
+
+def validateChange (req : Request) (before a : Analysis) : IO ChangePlan := do
+  let _ : Inhabited Environment := ⟨a.env⟩
+  let target ← resolveTarget before req.theoremName
+  let submittedTarget ← resolveTarget a req.theoremName
+  let targetOwner := before.owners[target]!
+  let submittedOwner := a.owners[submittedTarget]!
+  if commandHasSorry a a.commands[submittedOwner]! then
+    throw (IO.userError "Split parent must contain no sorry of its own")
+  let (oldHeader, _, _) ← Parser.parseHeader (Parser.mkInputContext before.source req.input)
+  let (newHeader, _, _) ← Parser.parseHeader (Parser.mkInputContext a.source req.input)
+  unless oldHeader.raw.reprint == newHeader.raw.reprint do
+    throw (IO.userError "Split changed the file imports")
+  let oldRanges ← commandRanges before
+  let ranges ← commandRanges a
+  let fixed ← targetScopeAnchors before a oldRanges ranges targetOwner submittedOwner
+  -- Match immutable commands in source order; only the assigned proof may change.
+  let mut origins := (Array.range a.commands.size).map (· + before.commands.size)
+  let mut matched : Std.HashSet Nat := {}
+  let mut anchors : Array Nat := #[]
+  let mut cursor := 0
+  for i in [:before.commands.size] do
+    let mut found := false
+    while cursor < a.commands.size do
+      let j := cursor
+      cursor := cursor + 1
+      let same := if i == targetOwner then j == submittedOwner
+        else if let some scope := fixed[i]? then j == scope
+        else commandText before oldRanges i == commandText a ranges j
+      if same && matchingScopeEnd before a anchors i j then
+        origins := origins.set! j i
+        matched := matched.insert j
+        anchors := anchors.push j
+        found := true
+        break
+    unless found do
+      throw (IO.userError s!"Split changed or removed an existing command: {commandText before oldRanges i}")
+  let oldNames := canonicalNames before (Array.range before.commands.size)
+  let newNames := canonicalNames a origins
+  let mut newByKey : Std.HashMap String Name := {}
+  for (n, _) in a.owners.toArray do
+    newByKey := newByKey.insert (nameKey newNames n) n
+  -- Earlier proofs can change mkAuxLemma's type cache and renumber later auxiliaries.
+  -- Their owning source commands are already matched verbatim above.
+  let auxiliary := (Meta.auxLemmasExt.getState before.env).lemmas.foldl
+    (fun names _ entry => names.insert entry.1) ({} : NameSet)
+  for (n, owner) in before.owners.toArray do
+    if owner == targetOwner && n != target then continue
+    let expected := (before.env.find? n).get!
+    if auxiliary.contains n then
+      if let .thmInfo _ := expected then continue
+    let some actualName := newByKey[nameKey oldNames n]?
+      | throw (IO.userError s!"Split removed declaration: {n}")
+    let actual := (a.env.find? actualName).get!
+    unless constantJson oldNames expected == constantJson newNames actual do
+      throw (IO.userError s!"Split changed the type or definition of: {n}")
+  let mut childOwners : Std.HashSet Nat := {}
+  for child in req.children do
+    let n ← resolveTarget a child
+    let owner := a.owners[n]!
+    childOwners := childOwners.insert owner
+  let mut added : Array SavedCommand := #[]
+  for i in [:a.commands.size] do
+    if matched.contains i then continue
+    let cmd := a.commands[i]!
+    if commandHasSorry a cmd && !childOwners.contains i then
+      throw (IO.userError "New sorry is only allowed in selected child theorem proofs")
+    for n in cmd.names do
+      if let some ci := a.env.find? n then
+        if ci.isUnsafe then throw (IO.userError s!"Split added an unsafe declaration: {n}")
+        if let .axiomInfo _ := ci then throw (IO.userError s!"Split added an axiom: {n}")
+    let source := if cmd.names.isEmpty then commandText a ranges i else ""
+    added := added.push { names := cmd.names.map visibleName, source }
+  let checkedNames := #[submittedTarget] ++ ((Array.range a.commands.size).filter
+    fun i => !matched.contains i).flatMap (fun i => a.commands[i]!.names)
+  let (_, axioms) := ((checkedNames.forM CollectAxioms.collect).run a.env).run {}
+  for ax in axioms.axioms do
+    unless #[``propext, ``Classical.choice, ``Quot.sound, ``sorryAx].contains ax do
+      throw (IO.userError s!"Submission uses untrusted axiom: {ax}")
+  return { origins, matched, added }
+
+unsafe def validateSplit (req : Request) (a : Analysis) : IO Unit := do
+  let before ← analyze req (some req.baseline)
+  let plan ← validateChange req before a
+  IO.FS.writeFile req.result (Json.mkObj [("added_commands", toJson plan.added)]).compress
+
+def pruneGenerated (req : Request) (a : Analysis) : IO Unit := do
+  let _ : Inhabited Environment := ⟨a.env⟩
+  let ranges ← commandRanges a
+  let generatedNames := req.generated.foldl (fun acc cmd =>
+    cmd.names.foldl (fun acc name => acc.insert name) acc) ({} : Std.HashSet String)
+  let generatedText := req.generated.foldl (fun acc cmd =>
+    if cmd.names.isEmpty then acc.insert cmd.source else acc) ({} : Std.HashSet String)
+  let mut seeds := #[]
+  for i in [:a.commands.size] do
+    let cmd := a.commands[i]!
+    let generated := if cmd.names.isEmpty then generatedText.contains (commandText a ranges i)
+      else cmd.names.any (fun n => generatedNames.contains (visibleName n))
+    if !generated then seeds := seeds.push i
+  for name in req.retain do
+    let n ← resolveTarget a name
+    seeds := seeds.push a.owners[n]!
+  let selected := selectFromCommands a seeds
+  let mut output := ""
+  let mut cursor : String.Pos.Raw := 0
+  let mut declarations : Array String := #[]
+  for i in [:a.commands.size] do
+    let range := ranges[i]!
+    output := output ++ String.Pos.Raw.extract a.source cursor range.start
+    if selected.contains i then
+      output := output ++ commandText a ranges i
+      declarations := declarations ++ a.commands[i]!.names.map visibleName
+    cursor := range.stop
+  output := output ++ String.Pos.Raw.extract a.source cursor a.source.rawEndPos
+  IO.FS.writeFile req.result (Json.mkObj [
+    ("source", toJson output), ("declarations", toJson declarations)]).compress
+
 unsafe def run (args : List String) : IO UInt32 := do
   let [requestPath] := args | throw (IO.userError "expected one request JSON file")
-  let req : Request ← IO.ofExcept (fromJson? (← readJson requestPath))
+  let input ← readJson requestPath
+  let fields ← IO.ofExcept input.getObj?
+  -- FromJson does not apply structure field defaults to omitted JSON keys.
+  let defaults := [("candidate", toJson ""), ("plan", toJson ""), ("logicalFile", toJson ""),
+    ("setup", Json.null), ("baseline", toJson ""), ("children", Json.arr #[]),
+    ("generated", Json.arr #[]), ("retain", Json.arr #[])]
+  let input := Json.mkObj (fields.toArray.toList ++ defaults.filter fun (key, _) =>
+    (input.getObjVal? key).toOption.isNone)
+  let req : Request ← IO.ofExcept (fromJson? input)
   Lean.initSearchPath (← Lean.findSysroot)
   let a ← analyze req
   match req.mode with
   | "extract" => extract req a
   | "verify" => verify req a
+  | "split" => validateSplit req a
+  | "prune" => pruneGenerated req a
   | _ => throw (IO.userError s!"unknown mode: {req.mode}")
   return 0
 
