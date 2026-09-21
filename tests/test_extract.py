@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +16,13 @@ CLI = ROOT / "lean-extract"
 LEAN = os.environ.get("TEST_LEAN") or shutil.which("lean") or "lean"
 PREFIX = subprocess.check_output([LEAN, "--print-prefix"], cwd=ROOT, text=True).strip()
 LEAN = str(Path(PREFIX) / "bin" / "lean")
+
+
+def setUpModule():
+    # Child CLI processes inherit the same archive setting.
+    environment = patch.dict(os.environ, {"LEAN_TOOL_FAILURE_ARCHIVE": "0"})
+    environment.start()
+    unittest.addModuleCleanup(environment.stop)
 
 
 class ExtractTests(unittest.TestCase):

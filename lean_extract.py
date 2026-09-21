@@ -6,10 +6,14 @@ import argparse
 import json
 import os
 from pathlib import Path
+import runpy
 import shutil
 import subprocess
 import sys
 import tempfile
+
+
+FailureArchive = runpy.run_path(str(Path(__file__).with_name("failure_archive.py")))["FailureArchive"]
 
 
 WORKER = Path(__file__).resolve().with_name("LeanExtract.lean")
@@ -26,7 +30,8 @@ def run_command(args: list[str], cwd: Path, env: dict[str, str]) -> str:
     if result.returncode:
         if result.stdout:
             print(result.stdout, end="", file=sys.stderr)
-        raise ExtractionError(f"command failed ({result.returncode}): {args[0]}")
+        raise ExtractionError(f"command failed ({result.returncode}): {args[0]}\n"
+                              f"{result.stdout}{result.stderr}".rstrip())
     return result.stdout
 
 
@@ -78,6 +83,13 @@ def environment(args: argparse.Namespace, source: Path) -> tuple[Path, str, dict
 
 
 def extract(args: argparse.Namespace) -> dict:
+    with FailureArchive(WORKER.parent, "extract",
+                        {"input.lean": Path(args.input).expanduser().absolute()}, vars(args),
+                        directory=getattr(args, "failure_dir", None)) as archive:
+        return _extract(args, archive)
+
+
+def _extract(args: argparse.Namespace, archive: FailureArchive) -> dict:
     source = Path(args.input).expanduser().resolve(strict=True)
     output = Path(args.output).expanduser().absolute()
     if not source.is_file() or source.suffix != ".lean":
@@ -95,8 +107,10 @@ def extract(args: argparse.Namespace) -> dict:
     cwd, lean, env, setup = environment(args, source)
     original_module = setup["name"] if setup else module_name(source, None)
     output_module = module_name(output, cwd if args.project or find_project(source) else None)
-    with tempfile.TemporaryDirectory(prefix="lean-extract-") as work:
+    with tempfile.TemporaryDirectory(prefix="lean-extract-") as work, archive:
         workdir = Path(work)
+        archive.files.update({name: workdir / name for name in
+                              ("candidate.lean", "plan.json", "verified.json", "request.json")})
         candidate = workdir / "candidate.lean"
         plan_path = workdir / "plan.json"
         result_path = workdir / "verified.json"
@@ -143,6 +157,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lean", help="Lean executable; defaults to the project's toolchain")
     parser.add_argument("--project", help="Lake project directory; discovered from input by default")
     parser.add_argument("--force", action="store_true", help="replace an existing output after verification")
+    parser.add_argument("--failure-dir", type=Path,
+                        help="failure archive directory; defaults to failures/ beside this tool")
     args = parser.parse_args(argv)
     try:
         plan = extract(args)

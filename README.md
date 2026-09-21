@@ -87,3 +87,13 @@ python3 -m unittest discover -s tests -v
 - `lean_extract.py`：命令行参数、工具链与项目环境、进程隔离及验证后写入。
 - `LeanExtract.lean`：Lean frontend、常量依赖闭包、源码命令映射、切片和类型核对。
 - `tests/`：端到端测试与示例输入。
+
+## 失败记录
+
+Python 命令行或 API 执行失败时，会在本工具目录的 `failures/` 下新建一个带 UTC 时间和随机后缀的目录，保存输入 Lean 代码、已有的临时请求和结果文件，以及 `failure.json` 和 `error.txt`。提取工具还会保存已生成的 `candidate.lean`；合并工具会分别保存 `base.lean` 和 `donor.lean`。`failure.json` 包含调用参数、原始路径和错误信息，归档路径打印到 stderr。
+
+成功时不创建记录。失败记录不会覆盖输入或已有输出，已加入 Git 忽略规则，可在修复后手动删除。归档写入失败时只打印提示，仍返回原始错误。AgentProver 的沙箱调用由宿主进程在同一位置保存记录；直接使用 `lean --run` 运行内部 Lean 文件不经过 Python 归档入口。
+
+`--failure-dir PATH` 可指定归档目录，供沙箱等只允许写入指定位置的调用方使用。
+
+设置 `LEAN_TOOL_FAILURE_ARCHIVE=0` 可关闭失败归档。测试套件自动设置此开关，避免预期失败写入工具目录；归档功能的专用测试仅在临时目录中启用归档。

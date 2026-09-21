@@ -557,7 +557,7 @@ def matchingScopeEnd (before a : Analysis) (anchors : Array Nat) (i j : Nat) : B
     !ends.contains i || (anchors[owner]?).any fun actual =>
       ((a.scopeEnds[actual]?).getD #[]).contains j
 
-def validateChange (req : Request) (before a : Analysis) : IO ChangePlan := do
+def validatePreservedChange (req : Request) (before a : Analysis) : IO ChangePlan := do
   let _ : Inhabited Environment := ⟨a.env⟩
   let target ← resolveTarget before req.theoremName
   let submittedTarget ← resolveTarget a req.theoremName
@@ -637,10 +637,127 @@ def validateChange (req : Request) (before a : Analysis) : IO ChangePlan := do
       throw (IO.userError s!"Submission uses untrusted axiom: {ax}")
   return { origins, matched, added }
 
+def validateChange (req : Request) (before a : Analysis) : IO (Array SavedCommand) := do
+  let _ : Inhabited Environment := ⟨a.env⟩
+  let target ← resolveTarget before req.theoremName
+  let submittedTarget ← resolveTarget a req.theoremName
+  let targetOwner := before.owners[target]!
+  let submittedOwner := a.owners[submittedTarget]!
+  if req.mode != "plan" && req.mode != "progress" && commandHasSorry a a.commands[submittedOwner]! then
+    throw (IO.userError "Split parent must contain no sorry of its own")
+  let oldRanges ← commandRanges before
+  let ranges ← commandRanges a
+  -- Match existing declarations independently of order. Statement-context comparison
+  -- runs separately on extracted copies whose target proofs have been replaced by sorry.
+  let mut matched : Std.HashSet Nat := {}
+  let mut usedOld : Std.HashSet Nat := {}
+  for j in [:a.commands.size] do
+    let cmd := a.commands[j]!
+    for i in [:before.commands.size] do
+      if usedOld.contains i then continue
+      let old := before.commands[i]!
+      let same := if j == submittedOwner then i == targetOwner
+        else if i == targetOwner then false
+        else if cmd.names.isEmpty then
+          old.names.isEmpty && commandText before oldRanges i == commandText a ranges j
+        else cmd.names.any fun n => old.names.any fun m => visibleName n == visibleName m
+      if same then
+        if commandHasSorry a cmd && !commandHasSorry before old then
+          throw (IO.userError "New sorry is only allowed in selected child theorem proofs")
+        matched := matched.insert j
+        usedOld := usedOld.insert i
+        break
+  let mut childOwners : Std.HashSet Nat := {}
+  for child in req.children do
+    let n ← resolveTarget a child
+    let owner := a.owners[n]!
+    childOwners := childOwners.insert owner
+  let mut added : Array SavedCommand := #[]
+  for i in [:a.commands.size] do
+    if matched.contains i then continue
+    let cmd := a.commands[i]!
+    if commandHasSorry a cmd && !childOwners.contains i then
+      throw (IO.userError "New sorry is only allowed in selected child theorem proofs")
+    for n in cmd.names do
+      if let some ci := a.env.find? n then
+        if ci.isUnsafe then throw (IO.userError s!"Split added an unsafe declaration: {n}")
+        if let .axiomInfo _ := ci then throw (IO.userError s!"Split added an axiom: {n}")
+    let source := if cmd.names.isEmpty then commandText a ranges i else ""
+    added := added.push { names := cmd.names.map visibleName, source }
+  let checkedNames := a.commands.flatMap (·.names)
+  let (_, axioms) := ((checkedNames.forM CollectAxioms.collect).run a.env).run {}
+  for ax in axioms.axioms do
+    unless #[``propext, ``Classical.choice, ``Quot.sound, ``sorryAx].contains ax do
+      throw (IO.userError s!"Submission uses untrusted axiom: {ax}")
+  return added
+
+unsafe def validatePlan (req : Request) (a : Analysis) : IO Unit := do
+  let _ : Inhabited Environment := ⟨a.env⟩
+  let before ← analyze req (some req.baseline)
+  let target ← resolveTarget before req.theoremName
+  let submittedTarget ← resolveTarget a req.theoremName
+  let added ← validateChange req before a
+  let mut allowedOwners : Std.HashSet Nat := {}
+  allowedOwners := allowedOwners.insert a.owners[submittedTarget]!
+  for child in req.children do
+    let n ← resolveTarget a child
+    allowedOwners := allowedOwners.insert a.owners[n]!
+  -- Names stay stable across command reordering and private declaration numbering.
+  let mut oldNames : Std.HashMap Name Name := {}
+  let mut newNames : Std.HashMap Name Name := {}
+  let mut newByName : Std.HashMap String Name := {}
+  for (n, _) in before.owners.toArray do
+    oldNames := oldNames.insert n (visibleName n).toName
+  for (n, _) in a.owners.toArray do
+    newNames := newNames.insert n (visibleName n).toName
+    newByName := newByName.insert (visibleName n) n
+  let auxiliary := (Meta.auxLemmasExt.getState before.env).lemmas.foldl
+    (fun names _ entry => names.insert entry.1) ({} : NameSet)
+  for (n, owner) in before.owners.toArray do
+    if owner == before.owners[target]! && n != target then continue
+    let expected := (before.env.find? n).get!
+    if auxiliary.contains n then
+      if let .thmInfo _ := expected then continue
+    let some actualName := newByName[visibleName n]?
+      | throw (IO.userError s!"Plan removed an existing declaration: {n}")
+    let actual := (a.env.find? actualName).get!
+    unless constantJson oldNames expected == constantJson newNames actual do
+      throw (IO.userError s!"Plan changed an existing type or definition: {n}")
+    if let .thmInfo _ := expected then
+      let (_, oldAxioms) := (CollectAxioms.collect n |>.run before.env).run {}
+      if !oldAxioms.axioms.contains ``sorryAx then
+        let (_, newAxioms) := (CollectAxioms.collect actualName |>.run a.env).run {}
+        if newAxioms.axioms.contains ``sorryAx then
+          throw (IO.userError s!"Plan discarded a completed proof: {n}")
+  for (n, owner) in a.owners.toArray do
+    let ci := (a.env.find? n).get!
+    if ci.isUnsafe then throw (IO.userError s!"Unsafe declaration: {n}")
+    if let .axiomInfo _ := ci then throw (IO.userError s!"Local axiom: {n}")
+    if ci.type.hasSorry then throw (IO.userError s!"Sorry in declaration type: {n}")
+    if (ci.value? (allowOpaque := true)).any Expr.hasSorry then
+      unless (match ci with | .thmInfo _ => true | _ => false) do
+        throw (IO.userError s!"Sorry is only allowed in theorem proof bodies: {n}")
+      let existed := before.owners.toArray.any fun (old, _) =>
+        visibleName old == visibleName n &&
+          ((before.env.find? old).any fun info => info.getUsedConstantsAsSet.contains ``sorryAx)
+      unless allowedOwners.contains owner || existed do
+        throw (IO.userError s!"Unregistered unfinished theorem: {n}")
+  IO.FS.writeFile req.result (Json.mkObj [("added_commands", toJson added)]).compress
+
 unsafe def validateSplit (req : Request) (a : Analysis) : IO Unit := do
   let before ← analyze req (some req.baseline)
-  let plan ← validateChange req before a
-  IO.FS.writeFile req.result (Json.mkObj [("added_commands", toJson plan.added)]).compress
+  let added ← if req.mode == "preserve" then
+    (·.added) <$> validatePreservedChange req before a
+    else validateChange req before a
+  IO.FS.writeFile req.result (Json.mkObj [("added_commands", toJson added)]).compress
+
+def listCommands (req : Request) (a : Analysis) : IO Unit := do
+  let ranges ← commandRanges a
+  -- Imports are parsed as the header, outside a.commands.
+  let commands := (Array.range a.commands.size).map (commandText a ranges)
+  IO.FS.writeFile req.result (Json.mkObj [
+    ("commands", toJson commands),
+    ("declarations", toJson (a.owners.toArray.map fun (n, _) => visibleName n))]).compress
 
 def pruneGenerated (req : Request) (a : Analysis) : IO Unit := do
   let _ : Inhabited Environment := ⟨a.env⟩
@@ -690,6 +807,10 @@ unsafe def run (args : List String) : IO UInt32 := do
   | "extract" => extract req a
   | "verify" => verify req a
   | "split" => validateSplit req a
+  | "preserve" => validateSplit req a
+  | "plan" => validatePlan req a
+  | "progress" => validatePlan req a
+  | "commands" => listCommands req a
   | "prune" => pruneGenerated req a
   | _ => throw (IO.userError s!"unknown mode: {req.mode}")
   return 0
