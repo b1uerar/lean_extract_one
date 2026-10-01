@@ -696,6 +696,19 @@ unsafe def validatePlan (req : Request) (a : Analysis) : IO Unit := do
   let before ← analyze req (some req.baseline)
   let target ← resolveTarget before req.theoremName
   let submittedTarget ← resolveTarget a req.theoremName
+  let existingNames := before.owners.toArray.foldl
+    (fun names (n, _) => names.insert (visibleName n)) ({} : Std.HashSet String)
+  let auxiliary := (Meta.auxLemmasExt.getState a.env).lemmas.foldl
+    (fun names _ entry => names.insert entry.1) ({} : NameSet)
+  let mut children : Array String := #[]
+  if req.mode == "plan" then
+    for cmd in a.commands do
+      for n in cmd.names do
+        if existingNames.contains (visibleName n) || auxiliary.contains n then continue
+        if let some (.thmInfo info) := a.env.find? n then
+          if info.value.getUsedConstantsAsSet.contains ``sorryAx then
+            children := children.push (visibleName n)
+  let req := { req with children }
   let added ← validateChange req before a
   let mut allowedOwners : Std.HashSet Nat := {}
   allowedOwners := allowedOwners.insert a.owners[submittedTarget]!
@@ -711,12 +724,12 @@ unsafe def validatePlan (req : Request) (a : Analysis) : IO Unit := do
   for (n, _) in a.owners.toArray do
     newNames := newNames.insert n (visibleName n).toName
     newByName := newByName.insert (visibleName n) n
-  let auxiliary := (Meta.auxLemmasExt.getState before.env).lemmas.foldl
+  let oldAuxiliary := (Meta.auxLemmasExt.getState before.env).lemmas.foldl
     (fun names _ entry => names.insert entry.1) ({} : NameSet)
   for (n, owner) in before.owners.toArray do
     if owner == before.owners[target]! && n != target then continue
     let expected := (before.env.find? n).get!
-    if auxiliary.contains n then
+    if oldAuxiliary.contains n then
       if let .thmInfo _ := expected then continue
     let some actualName := newByName[visibleName n]?
       | throw (IO.userError s!"Plan removed an existing declaration: {n}")
@@ -742,7 +755,8 @@ unsafe def validatePlan (req : Request) (a : Analysis) : IO Unit := do
           ((before.env.find? old).any fun info => info.getUsedConstantsAsSet.contains ``sorryAx)
       unless allowedOwners.contains owner || existed do
         throw (IO.userError s!"Unregistered unfinished theorem: {n}")
-  IO.FS.writeFile req.result (Json.mkObj [("added_commands", toJson added)]).compress
+  IO.FS.writeFile req.result (Json.mkObj [
+    ("added_commands", toJson added), ("children", toJson children)]).compress
 
 unsafe def validateSplit (req : Request) (a : Analysis) : IO Unit := do
   let before ← analyze req (some req.baseline)
