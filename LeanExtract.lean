@@ -21,6 +21,7 @@ structure Request where
   setup : Option ModuleSetup := none
   baseline : String := ""
   children : Array String := #[]
+  allowNewSorryTheorems : Bool := false
   generated : Array SavedCommand := #[]
   retain : Array String := #[]
   deriving FromJson
@@ -639,6 +640,7 @@ def validatePreservedChange (req : Request) (before a : Analysis) : IO ChangePla
 
 def validateChange (req : Request) (before a : Analysis) : IO (Array SavedCommand) := do
   let _ : Inhabited Environment := ⟨a.env⟩
+  let allowNewSorry := req.mode == "progress" && req.allowNewSorryTheorems
   let target ← resolveTarget before req.theoremName
   let submittedTarget ← resolveTarget a req.theoremName
   let targetOwner := before.owners[target]!
@@ -676,7 +678,7 @@ def validateChange (req : Request) (before a : Analysis) : IO (Array SavedComman
   for i in [:a.commands.size] do
     if matched.contains i then continue
     let cmd := a.commands[i]!
-    if commandHasSorry a cmd && !childOwners.contains i then
+    if commandHasSorry a cmd && !childOwners.contains i && !allowNewSorry then
       throw (IO.userError "New sorry is only allowed in selected child theorem proofs")
     for n in cmd.names do
       if let some ci := a.env.find? n then
@@ -753,7 +755,8 @@ unsafe def validatePlan (req : Request) (a : Analysis) : IO Unit := do
       let existed := before.owners.toArray.any fun (old, _) =>
         visibleName old == visibleName n &&
           ((before.env.find? old).any fun info => info.getUsedConstantsAsSet.contains ``sorryAx)
-      unless allowedOwners.contains owner || existed do
+      unless (req.mode == "progress" && req.allowNewSorryTheorems) ||
+          allowedOwners.contains owner || existed do
         throw (IO.userError s!"Unregistered unfinished theorem: {n}")
   IO.FS.writeFile req.result (Json.mkObj [
     ("added_commands", toJson added), ("children", toJson children)]).compress
@@ -811,6 +814,7 @@ unsafe def run (args : List String) : IO UInt32 := do
   -- FromJson does not apply structure field defaults to omitted JSON keys.
   let defaults := [("candidate", toJson ""), ("plan", toJson ""), ("logicalFile", toJson ""),
     ("setup", Json.null), ("baseline", toJson ""), ("children", Json.arr #[]),
+    ("allowNewSorryTheorems", toJson false),
     ("generated", Json.arr #[]), ("retain", Json.arr #[])]
   let input := Json.mkObj (fields.toArray.toList ++ defaults.filter fun (key, _) =>
     (input.getObjVal? key).toOption.isNone)
